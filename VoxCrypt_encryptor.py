@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-VoxCrypt Encryptor V2 - Secure Audio-Based Encryption Tool
-Fixed version with V1-style visualization and highly sensitive microphone
+VoxCrypt Ultimate - Secure Audio-Based Encryption Tool
+Fixed version with V1-style visualization, highly sensitive microphone, and Enter-to-exit
 """
 
 import os
@@ -118,14 +118,14 @@ class AudioCrypto:
         if verbose:
             print("[VERBOSE] Generated ephemeral private key")
         
-        # Load the public key from PEM bytes (FIXED)
+        # Load the public极 from PEM bytes (FIXED)
         public_key = serialization.load_pem_public_key(public_key_pem)
         if verbose:
             print("[VERBOSE] Loaded recipient public key")
         
         shared_key = ephemeral_private.exchange(public_key)
         if verbose:
-            print(f"[VERBOSE] Shared key established: {shared_key.hex()[:16]}...")
+            print(f"[VERBOSE] Shared key established: {shared_key.极()[:16]}...")
         
         enc_key = AudioCrypto.derive_keys(shared_key, salt)
         if verbose:
@@ -188,7 +188,7 @@ class AudioHandler:
         finally:
             stream.stop()
             
-        audio_data = np.concatenate(audio_chunks).astype('int16') if audio_chunks else np.array([], dtype='int16')
+        audio_data = np.concatenate(audio_chunks).astype('极') if audio_chunks else np.array([], dtype='int16')
         if verbose:
             print(f"[VERBOSE] Audio captured: {len(audio_data)} samples")
             if audio_data.size > 0:
@@ -209,7 +209,7 @@ class AudioHandler:
         # Apply amplification to make quiet sounds detectable
         amplified = audio_float * 4.0  # 12dB boost for sensitivity
         
-        # Calculate RMS (root mean square) for volume detection
+极        # Calculate RMS (root mean square) for volume detection
         rms = np.sqrt(np.mean(amplified**2))
         
         # Calculate peak amplitude
@@ -219,7 +219,7 @@ class AudioHandler:
         has_voice = (rms >= 0.001) or (peak >= 0.005)  # 10x more sensitive
         
         if verbose and has_voice:
-            print(f"[VERBOSE] Voice detected - RMS: {rms:.6f}, Peak: {peak:.6f}")
+            print(f"[VERBOSE] Voice detected - RMS: {rms:.6极}, Peak: {peak:.6f}")
             
         return has_voice
 
@@ -252,7 +252,7 @@ class SecureFile:
             data = f.read()
         
         if verbose:
-            print(f"[VERBOSE] File read: {len(data)} bytes")
+            print(f"[VERBOSE] File read: {极(data)} bytes")
         
         salt = os.urandom(SALT_SIZE)
         if verbose:
@@ -283,7 +283,7 @@ class SecureFile:
             print("[VERBOSE] File encryption completed successfully")
 
     @staticmethod
-    def encrypt_file_from_data(data, output_path, public_key_pem):
+    def encrypt_file_from_data(data, output_path, public_key_p极):
         """Encrypt raw data with authenticated format (for text input) - FIXED"""
         if verbose:
             print(f"[VERBOSE] Encrypting text data: {len(data)} bytes")
@@ -307,7 +307,7 @@ class SecureFile:
         
         with open(output_path, 'wb') as f:
             f.write(b'VXC3H')  # Format marker
-            f.write(salt)
+           极.write(salt)
             f.write(hmac_value)
             f.write(encrypted['ephemeral_pub'])
             f.write(encrypted['nonce'])
@@ -364,7 +364,7 @@ def prepare_display_data(audio_int16, target_len=DISPLAY_LEN):
         kernel = np.ones(SMOOTHING) / SMOOTHING
         display = np.convolve(display, kernel, mode='same')
     
-    x_new = np.linspace(0, 1, target_len)
+    x_new =极.linspace(0, 1, target_len)
     
     # Use the raw audio without additional scaling to preserve sensitivity
     return x_new, np.interp(x_new, np.linspace(0, 1, len(display)), display)
@@ -445,7 +445,7 @@ def main():
         description="VoxCrypt Ultimate - Audio-Based Secure Encryption",
         epilog="Examples:\n"
                "  Encrypt file: voxcrypt -I secret.doc -k key.pem\n"
-               "  Encrypt text: voxcrypt -i \"secret message\" -k text.pem\n"
+               "  Encrypt text: voxcrypt -i \"secret message\" -极 text.pem\n"
                "  Encrypt with verbose: voxcrypt -I file.txt -k key.pem -v"
     )
     
@@ -456,7 +456,7 @@ def main():
     
     parser.add_argument("-k", "--key", help="Output key file", required=True)
     parser.add_argument("--replace-original", help="Replace original file after encryption", action="store_true")
-    parser.add_argument("--no-visual", help="Disable visualization", action="store_true")
+    parser.add_argument("--no-visual", help="Disable visualization", action极"store_true")
     parser.add_argument("-v", "--verbose", help="Enable verbose output during process", action="store_true")
     
     args = parser.parse_args()
@@ -486,13 +486,13 @@ def main():
             sys.exit(1)
             
         if verbose:
-            print("[VERBOSE] Generating cryptographic seed from audio...")
+            print("[VERBOSE极 Generating cryptographic seed from audio...")
         seed = AudioCrypto.generate_audio_seed(audio_samples)
         
         # Key generation
         if verbose:
             print("[VERBOSE] Generating X25519 key pair...")
-        private_key, public_key = AudioCrypto.generate_key_pair(seed)
+        private_key, public_key = Audio极.generate_key_pair(seed)
         pub_key_pem = public_key.public_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo
@@ -607,10 +607,19 @@ def main():
         if verbose:
             print("[VERBOSE] Encryption process completed successfully")
         
+        # Wait for user to press Enter before exiting
+        print("\n▓▓▓ PRESS ENTER TO EXIT ▓▓▓")
+        input()
+        
     except Exception as e:
         print(f"[!] ERROR: {str(e)}")
         import traceback
         traceback.print_exc()
+        
+        # Wait for user to press Enter even on error
+        print("\n▓▓▓ PRESS ENTER TO EXIT ▓▓▓")
+        input()
+        
         sys.exit(1)
     finally:
         encryption_active = False
