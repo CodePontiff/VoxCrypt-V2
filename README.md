@@ -160,9 +160,15 @@ pip install -r requirements.txt
 
 ---
 
-## 🔮 Roadmap
+## 🔮 Roadmap:
 
 * [ ] Fully implement and test `--stream` mode.
+
+## 📷 Screenshoot:
+
+<img width="1342" height="143" alt="image" src="https://github.com/user-attachments/assets/3077528a-13be-4f37-8658-87eddfc33038" />
+<img width="1236" height="664" alt="image" src="https://github.com/user-attachments/assets/9cbac172-4110-49ac-b97e-01b6065a3ad0" />
+<img width="675" height="443" alt="image" src="https://github.com/user-attachments/assets/ec2c66b7-7b60-4b46-bdac-9d130af9f32d" />
 
 ---
 
