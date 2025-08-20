@@ -1,11 +1,8 @@
----
 
 # VoxCrypt V2 🔊🔐
 
 **VoxCrypt V2** is an audio-based encryption tool with a cyberpunk-style visualization.
 This release introduces major improvements over V1, especially in **cryptography** and support for **dynamic encryption**.
-
----
 
 ## ✨ Features
 
