@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 VoxCrypt-V2 Encryptor - Secure Audio-Based Encryption Tool
-Fixed version with proper Enter-to-exit logic
 """
 
 import os
@@ -42,16 +41,58 @@ TEXT_COLOR = '#e0e0ff'
 GLOW_ALPHA = 0.15
 
 # ========== CRYPTO CONFIG ==========
-SAMPLE_RATE = 44100
-SEED_CHUNK = 2048  # Larger chunk for better audio capture
+SAMPLE_RATE = 48000  # Higher sample rate for more detail
+SEED_CHUNK = 4096    # Larger chunk for better audio capture
 LIVE_CHUNK = 2048
 DISPLAY_LEN = 1024
 SALT_SIZE = 32
 HKDF_INFO = b"VoxCrypt v2 Key Derivation"
-MIN_RMS = 0.001    # 10x more sensitive
-MIN_PEAK = 0.005   # 10x more sensitive
 NONCE_SIZE = 12
-SMOOTHING = 8      # Less smoothing to preserve audio details
+SMOOTHING = 4        # Minimal smoothing to preserve all audio details
+
+# ========== SENSITIVITY CONFIG ==========
+SENSITIVITY_LEVELS = {
+    1: {  # Very Low
+        'min_rms': 0.01,
+        'min_peak': 0.05,
+        'record_boost': 2,    # 6dB
+        'live_boost': 1.5,    # 3.5dB
+        'visual_boost': 1,    # 0dB
+        'description': 'VERY LOW - For loud environments'
+    },
+    2: {  # Low
+        'min_rms': 0.005,
+        'min_peak': 0.025,
+        'record_boost': 4,    # 12dB
+        'live_boost': 3,      # 9.5dB
+        'visual_boost': 2,    # 6dB
+        'description': 'LOW - For normal speaking volume'
+    },
+    3: {  # Medium (Default)
+        'min_rms': 0.001,
+        'min_peak': 0.005,
+        'record_boost': 8,    # 18dB
+        'live_boost': 6,      # 15.6dB
+        'visual_boost': 4,    # 12dB
+        'description': 'MEDIUM - For quiet speaking'
+    },
+    4: {  # High
+        'min_rms': 0.0005,
+        'min_peak': 0.0025,
+        'record_boost': 16,   # 24dB
+        'live_boost': 12,     # 21.6dB
+        'visual_boost': 8,    # 18dB
+        'description': 'HIGH - For whispers'
+    },
+    5: {  # Very High
+        'min_rms': 0.0001,
+        'min_peak': 0.0005,
+        'record_boost': 32,   # 30dB
+        'live_boost': 24,     # 27.6dB
+        'visual_boost': 16,   # 24dB
+        'description': 'VERY HIGH - For extremely quiet sounds'
+    }
+}
 
 # ========== GLOBAL STATE ==========
 latest_audio_frame = np.zeros(DISPLAY_LEN, dtype=np.float32)
@@ -68,6 +109,9 @@ encryption_done = False
 base_name = "message"
 should_exit = False
 audio_stream = None
+entropy_collected = 0
+entropy_bits = 0
+sensitivity_level = 3  # Default to medium sensitivity
 
 # ========== CRYPTO CORE ==========
 class AudioCrypto:
@@ -76,11 +120,22 @@ class AudioCrypto:
         """Generate cryptographic seed from audio with OS entropy mixing"""
         if verbose:
             print("[VERBOSE] Generating audio seed with OS entropy mixing...")
-        audio_bytes = audio_samples.tobytes()
+        
+        # Apply amplification based on sensitivity level
+        boost = SENSITIVITY_LEVELS[sensitivity_level]['record_boost']
+        amplified = audio_samples.astype(np.float32) * boost
+        
+        audio_bytes = amplified.tobytes()
         os_entropy = os.urandom(32)
         seed = hashlib.blake2b(audio_bytes + os_entropy).digest()
+        
         if verbose:
             print(f"[VERBOSE] Audio seed generated: {seed.hex()[:16]}...")
+            rms = np.sqrt(np.mean(amplified**2))
+            peak = np.max(np.abs(amplified))
+            print(f"[VERBOSE] Enhanced audio levels - RMS: {rms:.8f}, Peak: {peak:.8f}")
+            print(f"[VERBOSE] Using sensitivity level {sensitivity_level}: {SENSITIVITY_LEVELS[sensitivity_level]['description']}")
+            
         return seed
 
     @staticmethod
@@ -159,26 +214,31 @@ class AudioHandler:
         print("\n▓▓▓ PRESS ENTER TO BEGIN AUDIO CAPTURE ▓▓▓")
         input()
         
-        print("»» SPEAK NOW - PRESS ENTER WHEN DONE ««")
+        print(f"»» SPEAK NOW - PRESS ENTER WHEN DONE ««")
+        print(f"»» SENSITIVITY LEVEL: {sensitivity_level} ({SENSITIVITY_LEVELS[sensitivity_level]['description']}) ««")
         audio_chunks = []
         
-        # Increase gain and sensitivity for recording
+        # Recording settings based on sensitivity level
+        boost = SENSITIVITY_LEVELS[sensitivity_level]['record_boost']
+        
         stream = sd.InputStream(
             samplerate=SAMPLE_RATE, 
             channels=1, 
             dtype='int16', 
             blocksize=SEED_CHUNK,
-            latency='low'  # Lower latency for better responsiveness
+            latency='low',  # Lowest latency for maximum sensitivity
+            extra_settings=None  # No additional filtering
         )
         stream.start()
         
         try:
             if verbose:
-                print("[VERBOSE] Audio capture started...")
+                print(f"[VERBOSE] Audio capture started with sensitivity level {sensitivity_level}...")
+                print(f"[VERBOSE] Using {boost}x amplification ({20*np.log10(boost):.1f}dB boost)")
             while True:
                 data, _ = stream.read(SEED_CHUNK)
-                # Apply gentle amplification to catch quiet sounds
-                amplified_data = data * 2  # 6dB boost
+                # Apply amplification based on sensitivity level
+                amplified_data = data * boost
                 audio_chunks.append(amplified_data.copy().flatten())
                 
                 # Check for Enter key press
@@ -196,20 +256,25 @@ class AudioHandler:
             if audio_data.size > 0:
                 rms = np.sqrt(np.mean(audio_data.astype(np.float32)**2))
                 peak = np.max(np.abs(audio_data))
-                print(f"[VERBOSE] Audio levels - RMS: {rms:.6f}, Peak: {peak}")
+                print(f"[VERBOSE] Audio levels - RMS: {rms:.8f}, Peak: {peak}")
         return audio_data
 
     @staticmethod
     def frame_has_voice(frame_i16):
-        """Detect if audio frame contains voice - MUCH more sensitive"""
+        """Detect if audio frame contains any sound - sensitivity based on level"""
         if frame_i16.size == 0:
             return False
+        
+        # Get sensitivity thresholds
+        min_rms = SENSITIVITY_LEVELS[sensitivity_level]['min_rms']
+        min_peak = SENSITIVITY_LEVELS[sensitivity_level]['min_peak']
+        boost = SENSITIVITY_LEVELS[sensitivity_level]['live_boost']
         
         # Convert to float and normalize
         audio_float = frame_i16.astype(np.float32) / 32768.0
         
-        # Apply amplification to make quiet sounds detectable
-        amplified = audio_float * 4.0  # 12dB boost for sensitivity
+        # Apply amplification based on sensitivity level
+        amplified = audio_float * boost
         
         # Calculate RMS (root mean square) for volume detection
         rms = np.sqrt(np.mean(amplified**2))
@@ -217,28 +282,55 @@ class AudioHandler:
         # Calculate peak amplitude
         peak = np.max(np.abs(amplified))
         
-        # VERY sensitive thresholds - will detect even quiet sounds
-        has_voice = (rms >= 0.001) or (peak >= 0.005)  # 10x more sensitive
+        # Sensitivity-based thresholds
+        has_sound = (rms >= min_rms) or (peak >= min_peak)
         
-        if verbose and has_voice:
-            print(f"[VERBOSE] Voice detected - RMS: {rms:.6f}, Peak: {peak:.6f}")
+        if verbose and has_sound:
+            print(f"[VERBOSE] Sound detected - RMS: {rms:.8f}, Peak: {peak:.8f}")
             
-        return has_voice
+        return has_sound
+
+    @staticmethod
+    def calculate_entropy(audio_data):
+        """Calculate approximate entropy bits from audio data"""
+        if audio_data.size < 100:
+            return 0
+            
+        # Convert to normalized float
+        audio_float = audio_data.astype(np.float32) / 32768.0
+        
+        # Calculate simple entropy approximation
+        diff = np.diff(audio_float)
+        unique_vals = len(np.unique(np.round(diff, decimals=4)))
+        
+        # Approximate entropy bits (log2 of unique values)
+        entropy_bits = np.log2(max(2, unique_vals))
+        
+        return entropy_bits
 
     @staticmethod
     def live_audio_callback(indata, frames, time_info, status):
-        """Live audio callback for visualization and salt generation - More sensitive"""
-        global latest_audio_frame, current_salt, current_salt_src
+        """Live audio callback for visualization and salt generation"""
+        global latest_audio_frame, current_salt, current_salt_src, entropy_collected, entropy_bits
         
-        # Apply amplification to incoming audio
-        amplified_data = indata[:, 0].astype(np.float32) * 3.0  # 9.5dB boost
+        # Apply amplification based on sensitivity level
+        boost = SENSITIVITY_LEVELS[sensitivity_level]['live_boost']
+        amplified_data = indata[:, 0].astype(np.float32) * boost
         latest_audio_frame = amplified_data.astype(np.int16)
         
         if AudioHandler.frame_has_voice(latest_audio_frame):
+            # Calculate entropy from this frame
+            frame_entropy = AudioHandler.calculate_entropy(latest_audio_frame)
+            entropy_bits += frame_entropy
+            entropy_collected += 1
+            
+            # Update salt with this high-entropy audio
             current_salt = hashlib.blake2b(latest_audio_frame.tobytes()).digest()
-            current_salt_src = "mic-voice"
-            if verbose:
-                print(f"[VERBOSE] Voice detected, salt updated: {current_salt.hex()[:8]}...")
+            current_salt_src = f"mic-voice ({entropy_bits:.1f} bits)"
+            
+            if verbose and entropy_collected % 10 == 0:
+                print(f"[VERBOSE] Entropy collected: {entropy_bits:.1f} bits from {entropy_collected} frames")
+                print(f"[VERBOSE] Current salt: {current_salt.hex()[:8]}...")
         else:
             current_salt = b""
             current_salt_src = "static"
@@ -354,21 +446,24 @@ def colorize_waveform(y_values):
     return colors
 
 def prepare_display_data(audio_int16, target_len=DISPLAY_LEN):
-    """Prepare audio data for visualization with sensitivity adjustments"""
+    """Prepare audio data for visualization"""
     if not audio_int16.size:
         return np.linspace(0, 1, target_len), np.zeros(target_len)
     
-    # Convert to float and apply gentle normalization (not compression)
+    # Convert to float and normalize
     display = audio_int16.astype(np.float32) / 32768.0
     
-    # Less aggressive smoothing to preserve audio details
+    # Apply amplification based on sensitivity level for visualization
+    visual_boost = SENSITIVITY_LEVELS[sensitivity_level]['visual_boost']
+    display = display * visual_boost
+    
+    # Minimal smoothing to preserve all audio details
     if len(display) >= SMOOTHING:
         kernel = np.ones(SMOOTHING) / SMOOTHING
         display = np.convolve(display, kernel, mode='same')
     
     x_new = np.linspace(0, 1, target_len)
     
-    # Use the raw audio without additional scaling to preserve sensitivity
     return x_new, np.interp(x_new, np.linspace(0, 1, len(display)), display)
 
 def update_cyber_visual(_frame_idx):
@@ -417,9 +512,11 @@ def update_cyber_visual(_frame_idx):
         status_text = recording_status
     
     status = [
-        f"▓▓▓ ENCRYPTION PROTOCOL ACTIVE ▓▓▓",
+        f"▓▓▓ ADJUSTABLE ENTROPY COLLECTION ▓▓▓",
+        f"» SENSITIVITY: LEVEL {sensitivity_level} - {SENSITIVITY_LEVELS[sensitivity_level]['description']}",
         f"» SALT: {current_salt.hex()[:12]}..." if current_salt else "» SALT: [SYSTEM DEFAULT]",
         f"» KEY SOURCE: {current_salt_src.upper()}",
+        f"» ENTROPY COLLECTED: {entropy_bits:.1f} bits",
         f"» STATUS: {status_text}"
     ]
     
@@ -427,7 +524,8 @@ def update_cyber_visual(_frame_idx):
         status.extend([
             "",
             "▓▓▓ MISSION SUMMARY ▓▓▓",
-            f"» OUTPUT: {base_name}.vxc"
+            f"» OUTPUT: {base_name}.vxc",
+            f"» TOTAL ENTROPY: {entropy_bits:.1f} bits"
         ])
         
         if verbose:
@@ -443,14 +541,15 @@ def update_cyber_visual(_frame_idx):
 
 # ========== MAIN APPLICATION ==========
 def main():
-    global encryption_active, user_finalized, args, verbose, encryption_done, base_name, audio_stream
+    global encryption_active, user_finalized, args, verbose, encryption_done, base_name, audio_stream, sensitivity_level
     
     parser = argparse.ArgumentParser(
-        description="VoxCrypt Ultimate - Audio-Based Secure Encryption",
+        description="VoxCrypt Ultimate - Audio-Based Secure Encryption with Adjustable Sensitivity",
         epilog="Examples:\n"
                "  Encrypt file: voxcrypt -I secret.doc -k key.pem\n"
                "  Encrypt text: voxcrypt -i \"secret message\" -k text.pem\n"
-               "  Encrypt with verbose: voxcrypt -I file.txt -k key.pem -v"
+               "  High sensitivity: voxcrypt -I file.txt -k key.pem -ss 5\n"
+               "  Low sensitivity: voxcrypt -I file.txt -k key.pem -ss 1"
     )
     
     group = parser.add_mutually_exclusive_group(required=True)
@@ -462,9 +561,15 @@ def main():
     parser.add_argument("--replace-original", help="Replace original file after encryption", action="store_true")
     parser.add_argument("--no-visual", help="Disable visualization", action="store_true")
     parser.add_argument("-v", "--verbose", help="Enable verbose output during process", action="store_true")
+    parser.add_argument("-ss", "--sound-sensitivity", 
+                       type=int, 
+                       choices=[1, 2, 3, 4, 5],
+                       default=3,
+                       help="Sound sensitivity level (1-5): 1=Very Low, 2=Low, 3=Medium, 4=High, 5=Very High")
     
     args = parser.parse_args()
     verbose = args.verbose
+    sensitivity_level = args.sound_sensitivity
     
     try:
         # Initialize
@@ -474,6 +579,7 @@ def main():
         if verbose:
             print("[VERBOSE] VoxCrypt Ultimate starting...")
             print(f"[VERBOSE] Arguments: {vars(args)}")
+            print(f"[VERBOSE] Using sensitivity level {sensitivity_level}: {SENSITIVITY_LEVELS[sensitivity_level]['description']}")
         
         # Set base name
         if args.input_file:
@@ -530,7 +636,7 @@ def main():
             
             update_cyber_visual.info_txt = ax.text(
                 0.02, 0.95,
-                "INITIALIZING ENCRYPTION SEQUENCE...",
+                "INITIALIZING ENTROPY COLLECTION...",
                 transform=ax.transAxes,
                 fontsize=10,
                 fontfamily='monospace',
@@ -539,7 +645,7 @@ def main():
             )
             
             fig.suptitle(
-                '»» VOXCRYPT ENCRYPTOR TERMINAL ««',
+                f'»» VOXCRYPT ENCRYPTOR - SENSITIVITY LEVEL {sensitivity_level} ««',
                 color=CYBER_COLORS['pink'],
                 fontsize=14,
                 fontweight='bold',
@@ -566,7 +672,9 @@ def main():
                 cache_frame_data=False
             )
             
-            print("\n▓▓▓ LIVE ENCRYPTION ACTIVE - PRESS ENTER TO FINALIZE ▓▓▓")
+            print(f"\n▓▓▓ LIVE ENTROPY COLLECTION ACTIVE - SENSITIVITY LEVEL {sensitivity_level} ▓▓▓")
+            print(f"▓▓▓ {SENSITIVITY_LEVELS[sensitivity_level]['description']} ▓▓▓")
+            print("▓▓▓ PRESS ENTER TO FINALIZE ▓▓▓")
             plt.show()
             
             # Cleanup
@@ -574,7 +682,8 @@ def main():
             audio_stream.close()
         else:
             # Non-visual mode
-            print("\n▓▓▓ ENCRYPTION IN PROGRESS ▓▓▓")
+            print(f"\n▓▓▓ ENCRYPTION IN PROGRESS - SENSITIVITY LEVEL {sensitivity_level} ▓▓▓")
+            print(f"▓▓▓ {SENSITIVITY_LEVELS[sensitivity_level]['description']} ▓▓▓")
             print("▓▓▓ PRESS ENTER TO FINALIZE ▓▓▓")
             input()
             user_finalized = True
@@ -607,6 +716,7 @@ def main():
         encryption_done = True
         print(f"\n▓▓▓ ENCRYPTION COMPLETE ▓▓▓")
         print(f"» Output: {output_path}")
+        print(f"» Total entropy collected: {entropy_bits:.1f} bits")
         
         if verbose:
             print("[VERBOSE] Encryption process completed successfully")
