@@ -132,10 +132,10 @@ example_backups/
 * Python 3.8+
 * Dependencies:
 
-  * `cryptography`
-  * `sounddevice`
-  * `numpy`
-  * `matplotlib`
+  * `cryptography>=41.0.0`
+  * `pycryptodome>=3.19.0`
+  * `numpy>=1.24.0`
+  * `matplotlib>=3.7.0`
 
 Install dependencies:
 
