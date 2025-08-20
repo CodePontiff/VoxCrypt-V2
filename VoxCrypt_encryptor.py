@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VoxCrypt Ultimate - Secure Audio-Based Encryption Tool
+VoxCrypt Encryptor V2 - Secure Audio-Based Encryption Tool
 Fixed version with V1-style visualization and highly sensitive microphone
 """
 
