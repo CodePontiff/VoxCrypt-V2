@@ -26,15 +26,16 @@ This release introduces major improvements over V1, especially in **cryptography
 ```
 Encryptor Command Line Options:
 
-| Option                  | Description                                                                 |
-|--------------------------|-----------------------------------------------------------------------------|
-| `-i, --input`            | Encrypt plain text directly from CLI input.                                |
-| `-I, --input-file`       | Encrypt a file (e.g., `.txt`, `.jpg`, `.mp3`).                             |
-| `--stream`               | Encrypt data from a stream source (⚠️ experimental, not fully tested).     |
-| `-k, --key`              | Specify the key file (required).                                            |
-| `--replace-original`     | Replace the original file after encryption (⚠️ **will overwrite**, backup recommended). |
-| `--no-visual`            | Disable visualization (no waveform or graphical output).                   |
-| `-v, --verbose`          | Enable verbose output for detailed process logging. 
+| Option                              | Description                                                                             |
+|-------------------------------------|-----------------------------------------------------------------------------------------|
+| `-i, --input`                       | Encrypt plain text directly from CLI input.                                             |
+| `-I, --input-file`                  | Encrypt a file (e.g., `.txt`, `.jpg`, `.mp3`).                                          |
+| `--stream`                          | Encrypt data from a stream source (⚠️ experimental, not fully tested).                  |
+| `-k, --key`                         | Specify the key file (required).                                                        |
+| `--replace-original`                | Replace the original file after encryption (⚠️ **will overwrite**, backup recommended). |
+| `--no-visual`                       | Disable visualization (no waveform or graphical output).                                |
+| `-v, --verbose`                     | Enable verbose output for detailed process logging.                                     |
+| `-ss, --sound-sensitivity`          | Sound sensitivity for audio salt entropy (1 - 5 very low, low, medium, high, very high).|
 ```
 
 #### 1. Encrypt a File
