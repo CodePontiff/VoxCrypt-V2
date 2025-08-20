@@ -1,0 +1,13 @@
+# VoxCrypt V2 - Requirements
+# For both encryptor and decryptor
+
+# Core cryptography libraries
+cryptography>=41.0.0
+pycryptodome>=3.19.0
+
+# Audio processing
+sounddevice>=0.4.6
+numpy>=1.24.0
+
+# Visualization (encryptor only)
+matplotlib>=3.7.0
