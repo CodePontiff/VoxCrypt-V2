@@ -21,7 +21,21 @@ This release introduces major improvements over V1, especially in **cryptography
 
 ## 🚀 Usage
 
-### 🔐 Encryption (voxcrypt.py)
+### 🔐 Encryption (VoxCrypt_encryptor.py)
+
+```
+## Command Line Options
+
+| Option                  | Description                                                                 |
+|--------------------------|-----------------------------------------------------------------------------|
+| `-i, --input`            | Encrypt plain text directly from CLI input.                                |
+| `-I, --input-file`       | Encrypt a file (e.g., `.txt`, `.jpg`, `.mp3`).                             |
+| `--stream`               | Encrypt data from a stream source (⚠️ experimental, not fully tested).     |
+| `-k, --key`              | Specify the key file (required).                                            |
+| `--replace-original`     | Replace the original file after encryption (⚠️ **will overwrite**, backup recommended). |
+| `--no-visual`            | Disable visualization (no waveform or graphical output).                   |
+| `-v, --verbose`          | Enable verbose output for detailed process logging. 
+```
 
 #### 1. Encrypt a File
 
@@ -78,7 +92,7 @@ You will need the correct private key to restore the file later.
 
 ---
 
-### 🔓 Decryption (voxdecrypt.py)
+### 🔓 Decryption (VoxCrypt_decryptor.py)
 
 The decryptor works with **both text and binary files**. It verifies HMAC, loads the ephemeral public key, and restores the original plaintext.
 
