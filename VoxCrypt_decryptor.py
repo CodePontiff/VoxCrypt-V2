@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VoxCrypt Decryptor - Fixed to handle both text and binary files
+VoxCrypt Decryptor V2 - Fixed to handle both text and binary files
 """
 
 import os
