@@ -1,95 +1,159 @@
-# VoxCrypt - Audio-Based Secure Encryption
- 
- 
- ## 🔐 About
- 
- VoxCrypt is an innovative encryption tool that uses your voice as a cryptographic seed, combined with modern encryption algorithms for secure file protection. It features:
- 
- - **Audio-derived keys** - Your voice generates unique encryption keys
- - **Dual encryption modes** - Choose between static file or continuous stream encryption
- - **Military-grade crypto** - XChaCha20-Poly1305 + X25519 + HKDF-BLAKE2b
- - **Cyberpunk visualization** - Real-time audio waveform display
- 
- ## 📦 Installation
+---
+
+# VoxCrypt V2 🔊🔐
+
+**VoxCrypt V2** is an audio-based encryption tool with a cyberpunk-style visualization.
+This release introduces major improvements over V1, especially in **cryptography** and support for **dynamic encryption**.
+
+---
+
+## ✨ Features
+
+* 🎙️ **Audio-seeded encryption**: Keys are derived from voice input + OS entropy.
+* 🔑 **X25519 keypair** generated directly from audio.
+* 🛡️ **ChaCha20-Poly1305** for strong and fast encryption.
+* 🎨 **Cyberpunk waveform visualization** (can be disabled with `--no-visual`).
+* 📂 **Encrypt files or plaintext** directly from the command line.
+* ⚡ **Streaming mode** via `--stream` (experimental, untested).
+* 📜 Authenticated output format with header, salt, HMAC, and ephemeral public key.
+* 🔓 **Decryption support** via `voxdecrypt.py`, works for both text and binary files.
+
+---
+
+## 🚀 Usage
+
+### 🔐 Encryption (voxcrypt.py)
+
+#### 1. Encrypt a File
+
+```bash
+python voxcrypt.py -I secret.doc -k mykey.pem
 ```
-git clone https://github.com/yourusername/VoxCrypt.git
-cd VoxCrypt
+
+* Produces `secret.vxc` (encrypted file).
+* Private key saved in `mykey.pem`.
+
+#### 2. Encrypt Plaintext
+
+```bash
+python voxcrypt.py -i "secret message" -k textkey.pem
+```
+
+* Produces `message.vxc`.
+
+#### 3. Encrypt with Cyberpunk Visualization
+
+```bash
+python voxcrypt.py -I notes.txt -k key.pem
+```
+
+* Press **Enter** to start audio recording.
+* Press **Enter** again to finish.
+
+#### 4. Encrypt Without Visualization
+
+```bash
+python voxcrypt.py -I data.bin -k key.pem --no-visual
+```
+
+#### 5. Streaming Mode (Experimental, Untested)
+
+```bash
+python voxcrypt.py --stream camera_feed -k streamkey.pem
+```
+
+⚠️ This feature is **experimental and untested**. Use at your own risk.
+
+#### ⚠️ Important Warning: `--replace-original`
+
+You can force encryption to overwrite the original file with:
+
+```bash
+python voxcrypt.py -I secret.doc -k key.pem --replace-original
+```
+
+⚠️ **Warning:**
+Using `--replace-original` will **overwrite your original file permanently**.
+It is strongly recommended to make a **backup copy** first.
+You will need the correct private key to restore the file later.
+
+---
+
+### 🔓 Decryption (voxdecrypt.py)
+
+The decryptor works with **both text and binary files**. It verifies HMAC, loads the ephemeral public key, and restores the original plaintext.
+
+#### Basic Decryption
+
+```bash
+python voxdecrypt.py -i secret.vxc -k mykey.pem -o recovered.doc
+```
+
+* `-i` : Encrypted input file (`.vxc`)
+* `-k` : Private key file (PEM or raw 32-byte key)
+* `-o` : Output file (restored original data)
+
+Example output:
+
+```
+▓▓▓ DECRYPTING: secret.vxc (2048 bytes) ▓▓▓
+▓▓▓ USING KEY: mykey.pem ▓▓▓
+Detected VXC3H format (static file)
+Reading file components...
+HMAC verified successfully
+Decryption successful!
+✓ Detected file type: PDF
+✓ Decryption completed successfully
+▓▓▓ SUCCESS: Decrypted to recovered.doc ▓▓▓
+```
+
+#### Notes
+
+* The decryptor automatically detects whether the decrypted data is **text or binary**.
+* It attempts to identify file signatures (JPEG, PNG, PDF, ZIP, MP3, etc.) for convenience.
+* If verification fails, the decryptor cleans up any partial output file.
+
+---
+
+## 📦 Output Format
+
+Encrypted files follow this structure:
+
+```
+[Header: VXC3H][Salt][HMAC][Ephemeral Public Key][Nonce][Ciphertext]
+```
+
+---
+
+## 🛠️ Requirements
+
+* Python 3.8+
+* Dependencies:
+
+  * `cryptography`
+  * `sounddevice`
+  * `numpy`
+  * `matplotlib`
+
+Install dependencies:
+
+```bash
 pip install -r requirements.txt
 ```
-```
-Requirements:
 
-Python 3.8+
+---
 
-cryptography library
+## 🔮 Roadmap
 
-sounddevice for audio capture
+* [ ] Fully implement and test `--stream` mode.
+* [ ] Add decryption with audio authentication (not just key).
+* [ ] Support multiple recipient public keys.
+* [ ] Hardware entropy integration.
 
-matplotlib for visualization
-```
+---
 
-🚀 Usage
-Encryption
-```
-# Encrypt a file (creates document.pdf.vxc)
-python VoxCrypt.py -I document.pdf -k doc_key.pem
+## ⚠️ Disclaimer
 
-# Encrypt a stream (creates data.log.vxcs)
-python VoxCrypt.py --stream data.log -k stream_key.pem
+VoxCrypt is an experimental project. Do not use it for production or highly sensitive data without a full security audit.
 
-# Encrypt text (creates message.vxc)
-python VoxCrypt.py -i "Secret message" -k msg_key.pem
-Decryption
-
-# Decrypt files
-python VoxCrypt_decryptor.py -i file.vxc -k key.pem -o output.txt
-
-# Decrypt streams 
-python VoxCrypt_decryptor.py -i log.vxcs -k stream_key.pem -o original.log
-```
-
-🔧 Technical Details
-Encryption Modes
-Mode	Extension	Best For	Key Feature
-Static	.vxc	Files, text	Single encryption
-Stream	.vxcs	Logs, databases	Chunked with live salt
-Cryptographic Stack
-Key Exchange: X25519 elliptic curve
-
-Encryption: XChaCha20-Poly1305 (256-bit)
-
-Key Derivation: HKDF with BLAKE2b
-
-Authentication: HMAC-BLAKE2b
-
-🛡️ Security Features
-Perfect Forward Secrecy - Ephemeral session keys
-
-Authenticated Encryption - HMAC verified decryption
-
-Voice Activity Detection - Dynamic salt generation
-
-Entropy Mixing - Combines audio with OS randomness
-
-🌟 Example Workflow
-Generate encrypted file:
-
-bash
-python VoxCrypt.py -I secret.docx -k secret.pem
-Securely transfer:
-
-secret.docx.vxc (encrypted file)
-
-secret.pem (private key)
-
-Decrypt on recipient side:
-
-bash
-python VoxCrypt_decryptor.py -i secret.docx.vxc -k secret.pem -o secret.docx
-📜 License
-MIT License - See LICENSE for details.
-
-⚠️ Disclaimer
-This is experimental software. For truly sensitive data, use professionally audited tools like GPG or VeraCrypt.
-
-"Your voice is your key" 🔑🗝️
+---
