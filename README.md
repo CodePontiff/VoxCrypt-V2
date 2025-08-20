@@ -24,7 +24,7 @@ This release introduces major improvements over V1, especially in **cryptography
 ### 🔐 Encryption (VoxCrypt_encryptor.py)
 
 ```
-## Command Line Options
+Encryptor Command Line Options:
 
 | Option                  | Description                                                                 |
 |--------------------------|-----------------------------------------------------------------------------|
@@ -96,15 +96,15 @@ You will need the correct private key to restore the file later.
 
 The decryptor works with **both text and binary files**. It verifies HMAC, loads the ephemeral public key, and restores the original plaintext.
 
-#### Basic Decryption
-
-```bash
-python VoxCrypt_decryptor.py -i secret.vxc -k mykey.pem -o recovered.doc
 ```
+Decryptor Command Line Options:
 
-* `-i` : Encrypted input file (`.vxc`)
-* `-k` : Private key file (PEM or raw 32-byte key)
-* `-o` : Output file (restored original data)
+| Option                  | Description                                                                 |
+|--------------------------|-----------------------------------------------------------------------------|
+| `-i, --input`            | Input encrypted file (`.vxc`) to decrypt.                                  |
+| `-k, --key`              | Private key file used for decryption.                                      |
+| `-o, --output`           | Output file path where the decrypted content will be saved.                |
+```
 
 Example output:
 
