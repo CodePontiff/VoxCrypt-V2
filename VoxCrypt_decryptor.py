@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VoxCrypt-V2 Decryptor - Fixed to handle both text and binary files
+VoxCrypt-V2 Decryptor - Decryptor for VoxCrypt (.vxc)
 """
 
 import os
