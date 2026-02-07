@@ -478,7 +478,13 @@ def update_cyber_visual(_frame_idx):
         _ = sys.stdin.readline()
         user_finalized = True
         should_exit = True
-        plt.close()  # Close the visualization window
+        # Set a flag to stop animation instead of immediately closing
+        if hasattr(update_cyber_visual, 'animation_running'):
+            update_cyber_visual.animation_running = False
+        return []
+    
+    # Check if animation should stop
+    if hasattr(update_cyber_visual, 'animation_running') and not update_cyber_visual.animation_running:
         return []
     
     x_disp, y_disp = prepare_display_data(latest_audio_frame, DISPLAY_LEN)
@@ -663,7 +669,8 @@ def main():
             )
             audio_stream.start()
             
-            # Start animation
+            # Start animation with event listener
+            update_cyber_visual.animation_running = True
             ani = FuncAnimation(
                 fig, 
                 update_cyber_visual, 
@@ -672,10 +679,23 @@ def main():
                 cache_frame_data=False
             )
             
+            # Add event listener for window close
+            def on_close(event):
+                update_cyber_visual.animation_running = False
+                global user_finalized
+                user_finalized = True
+                
+            fig.canvas.mpl_connect('close_event', on_close)
+            
             print(f"\n▓▓▓ LIVE ENTROPY COLLECTION ACTIVE - SENSITIVITY LEVEL {sensitivity_level} ▓▓▓")
             print(f"▓▓▓ {SENSITIVITY_LEVELS[sensitivity_level]['description']} ▓▓▓")
             print("▓▓▓ PRESS ENTER TO FINALIZE ▓▓▓")
             plt.show()
+            
+            # Stop animation before cleanup
+            update_cyber_visual.animation_running = False
+            if hasattr(ani, 'event_source') and ani.event_source:
+                ani.event_source.stop()
             
             # Cleanup
             audio_stream.stop()
@@ -729,6 +749,11 @@ def main():
         print(f"[!] ERROR: {str(e)}")
         import traceback
         traceback.print_exc()
+        
+        # Stop animation if it exists
+        if 'update_cyber_visual' in globals():
+            if hasattr(update_cyber_visual, 'animation_running'):
+                update_cyber_visual.animation_running = False
         
         # Wait for user to press Enter even on error
         print("\n▓▓▓ PRESS ENTER TO EXIT ▓▓▓")
