@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-VoxCrypt-V2 Decryptor - Decryptor for VoxCrypt (.vxc)
+VoxCrypt Decryptor - Decrypts and replaces .vxc files with original content
+Removes .vxc extension after successful decryption
 """
 
 import os
 import sys
 import argparse
+import shutil
 from cryptography.hazmat.primitives import hashes, hmac
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
@@ -80,59 +82,24 @@ class VoxDecrypt:
         return data
 
     @staticmethod
-    def is_text_data(data):
-        """Check if data is likely text (not binary)"""
-        if len(data) == 0:
-            return False
-        
-        # Check for common binary file signatures
-        binary_signatures = [
-            b'\xff\xd8\xff',  # JPEG
-            b'\x89PNG',        # PNG
-            b'%PDF',           # PDF
-            b'\x50\x4B\x03',   # ZIP/Office
-            b'\x49\x49\x2A',   # TIFF
-            b'\x4D\x4D\x00',   # TIFF
-            b'\x47\x49\x46',   # GIF
-            b'\x52\x49\x46\x46',  # WEBP, AVI
-            b'\x1A\x45\xDF\xA3',  # WebM, MKV
-            b'\x00\x00\x00\x20',  # MP4
-            b'\x49\x44\x33',      # MP3
-            b'\xFF\xFB',          # MP3
-            b'\xFF\xF3',          # MP3
-            b'\xFF\xF2',          # MP3
-        ]
-        
-        for sig in binary_signatures:
-            if data.startswith(sig):
-                return False
-        
-        # Check if data contains many non-printable characters
-        printable_count = 0
-        for byte in data[:1000]:  # Check first 1000 bytes
-            if 32 <= byte <= 126 or byte in (9, 10, 13):  # Printable ASCII + tab, LF, CR
-                printable_count += 1
-        
-        return printable_count / min(len(data), 1000) > 0.8  # 80% printable
-
-    @staticmethod
-    def decrypt_file(input_path, key_path, output_path):
-        """Decrypt .vxc file"""
+    def decrypt_and_rename(input_path, key_path):
+        """Decrypt .vxc file and rename to original name (without .vxc)"""
         try:
             with open(input_path, 'rb') as f:
                 header = f.read(5)
                 
                 if header == b'VXC3H':
                     print("Detected VXC3H format (static file)")
-                    return VoxDecrypt._decrypt_static(f, key_path, output_path)
+                    return VoxDecrypt._decrypt_static_and_rename(f, key_path, input_path)
                 else:
                     raise ValueError(f"Invalid file format header: {header}")
         except Exception as e:
             raise ValueError(f"File reading failed: {str(e)}")
 
     @staticmethod
-    def _decrypt_static(file_obj, key_path, output_path):
-        """Decrypt static .vxc file with proper PEM handling"""
+    def _decrypt_static_and_rename(file_obj, key_path, input_path):
+        """Decrypt static .vxc file and rename to original name"""
+        temp_path = None
         try:
             print("Reading file components...")
             
@@ -193,58 +160,45 @@ class VoxDecrypt:
             plaintext = cipher.decrypt(nonce, ciphertext, None)
             print("Decryption successful!")
             
-            # Verify the decrypted data
             if len(plaintext) == 0:
                 raise ValueError("Decrypted data is empty")
             
-            # Detect file type and handle appropriately
-            if VoxDecrypt.is_text_data(plaintext):
-                try:
-                    decoded_text = plaintext.decode('utf-8')
-                    print(f"Decrypted text: {decoded_text[:100]}..." if len(decoded_text) > 100 else decoded_text)
-                except UnicodeDecodeError:
-                    print("Decrypted data appears to be binary (UTF-8 decode failed)")
+            # Create output filename without .vxc extension
+            if input_path.lower().endswith('.vxc'):
+                output_path = input_path[:-4]  # Remove .vxc
             else:
-                print("Decrypted data appears to be binary")
-                
-                # Check for common file signatures
-                file_signatures = {
-                    b'\xff\xd8\xff': 'JPEG',
-                    b'\x89PNG': 'PNG', 
-                    b'%PDF': 'PDF',
-                    b'\x50\x4B\x03': 'ZIP/Office',
-                    b'\x49\x49\x2A': 'TIFF',
-                    b'\x4D\x4D\x00': 'TIFF',
-                    b'\x47\x49\x46': 'GIF',
-                    b'\x52\x49\x46\x46': 'WEBP/AVI',
-                    b'\x1A\x45\xDF\xA3': 'WebM/MKV',
-                    b'\x00\x00\x00\x20': 'MP4',
-                    b'\x49\x44\x33': 'MP3',
-                }
-                
-                for sig, filetype in file_signatures.items():
-                    if plaintext.startswith(sig):
-                        print(f"✓ Detected file type: {filetype}")
-                        break
-                else:
-                    print("⚠ File type not recognized")
+                output_path = input_path + ".decrypted"
             
-            # Write output
-            print("Writing output file...")
-            with open(output_path, 'wb') as f:
+            # Write decrypted content to output file
+            print(f"Writing decrypted content to: {output_path}")
+            temp_path = output_path + ".temp"
+            with open(temp_path, 'wb') as f:
                 f.write(plaintext)
-            print("✓ Decryption completed successfully")
+            
+            # Verify the temp file
+            if os.path.getsize(temp_path) == len(plaintext):
+                # Rename temp file to final output
+                os.replace(temp_path, output_path)
+                print("✓ Decrypted file created successfully")
+                
+                # Remove the original .vxc file
+                if input_path != output_path and os.path.exists(input_path):
+                    os.remove(input_path)
+                    print(f"✓ Removed encrypted file: {input_path}")
+            else:
+                raise ValueError("Temporary file size mismatch")
                 
         except Exception as e:
-            import traceback
-            error_details = traceback.format_exc()
-            raise ValueError(f"Static decryption failed: {str(e)}\n{error_details}")
+            # Clean up temp file if it exists
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise ValueError(f"Decryption failed: {str(e)}")
 
 def main():
-    parser = argparse.ArgumentParser(description="VoxCrypt File Decryptor")
-    parser.add_argument("-i", "--input", help="Input file (.vxc)", required=True)
+    parser = argparse.ArgumentParser(description="VoxCrypt File Decryptor - Creates decrypted file without .vxc extension")
+    parser.add_argument("-i", "--input", help="Input .vxc file to decrypt", required=True)
     parser.add_argument("-k", "--key", help="Private key file", required=True)
-    parser.add_argument("-o", "--output", help="Output file path", required=True)
+    parser.add_argument("-o", "--output", help="Output file path (optional, defaults to input without .vxc)")
     
     args = parser.parse_args()
     
@@ -261,21 +215,34 @@ def main():
         print(f"▓▓▓ DECRYPTING: {args.input} ({input_size} bytes) ▓▓▓")
         print(f"▓▓▓ USING KEY: {args.key} ▓▓▓")
         
-        VoxDecrypt.decrypt_file(args.input, args.key, args.output)
-        print(f"▓▓▓ SUCCESS: Decrypted to {args.output} ▓▓▓")
+        # Determine output filename
+        if args.output:
+            output_path = args.output
+        else:
+            # Remove .vxc extension if present
+            if args.input.lower().endswith('.vxc'):
+                output_path = args.input[:-4]
+            else:
+                output_path = args.input + ".decrypted"
         
-        # Verify the output file
-        output_size = os.path.getsize(args.output)
-        print(f"▓▓▓ OUTPUT SIZE: {output_size} bytes ▓▓▓")
+        # Check if output file already exists
+        if os.path.exists(output_path):
+            print(f"[!] Warning: Output file already exists: {output_path}")
+            print("    It will be overwritten.")
+        
+        VoxDecrypt.decrypt_and_rename(args.input, args.key)
+        
+        # Verify output
+        if os.path.exists(output_path):
+            restored_size = os.path.getsize(output_path)
+            print(f"▓▓▓ OUTPUT SIZE: {restored_size} bytes ▓▓▓")
+            print(f"▓▓▓ SUCCESS: Decrypted file created: {output_path} ▓▓▓")
+        else:
+            print("[!] ERROR: Output file was not created")
+            sys.exit(1)
         
     except Exception as e:
         print(f"[!] DECRYPTION FAILED: {str(e)}")
-        if os.path.exists(args.output):
-            try:
-                os.remove(args.output)
-                print("▓▓▓ Cleaned up partial output ▓▓▓")
-            except:
-                pass
         sys.exit(1)
 
 if __name__ == "__main__":
