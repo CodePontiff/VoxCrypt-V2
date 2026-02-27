@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-VoxCrypt-V2 Encryptor - Secure Audio-Based Encryption Tool
+VoxCrypt-V2 Encryptor - Secure Audio-Based Encryption Tool with Real-time Streaming
+FIXED: Removed audio entropy from nonce to make streaming mode decryptable
+ADDED: --replace-original with immediate file replacement during audio capture
 """
 
 import os
@@ -8,6 +10,8 @@ import sys
 import time
 import argparse
 import hashlib
+import threading
+import queue
 import numpy as np
 import sounddevice as sd
 import select
@@ -41,55 +45,60 @@ TEXT_COLOR = '#e0e0ff'
 GLOW_ALPHA = 0.15
 
 # ========== CRYPTO CONFIG ==========
-SAMPLE_RATE = 48000  # Higher sample rate for more detail
-SEED_CHUNK = 4096    # Larger chunk for better audio capture
-LIVE_CHUNK = 2048
+SAMPLE_RATE = 48000
+SEED_CHUNK = 4096
+LIVE_CHUNK = 1024
 DISPLAY_LEN = 1024
 SALT_SIZE = 32
 HKDF_INFO = b"VoxCrypt v2 Key Derivation"
 NONCE_SIZE = 12
-SMOOTHING = 4        # Minimal smoothing to preserve all audio details
+SMOOTHING = 4
+
+# ========== STREAMING CONFIG ==========
+STREAM_CHUNK_SIZE = 256  # Small chunks for frequent updates
+STREAM_ENCRYPTION_INTERVAL = 0.02  # 20ms between chunks
+STREAM_READ_BUFFER = 1024  # For file reading
 
 # ========== SENSITIVITY CONFIG ==========
 SENSITIVITY_LEVELS = {
     1: {  # Very Low
         'min_rms': 0.01,
         'min_peak': 0.05,
-        'record_boost': 2,    # 6dB
-        'live_boost': 1.5,    # 3.5dB
-        'visual_boost': 1,    # 0dB
+        'record_boost': 2,
+        'live_boost': 1.5,
+        'visual_boost': 1,
         'description': 'VERY LOW - For loud environments'
     },
     2: {  # Low
         'min_rms': 0.005,
         'min_peak': 0.025,
-        'record_boost': 4,    # 12dB
-        'live_boost': 3,      # 9.5dB
-        'visual_boost': 2,    # 6dB
+        'record_boost': 4,
+        'live_boost': 3,
+        'visual_boost': 2,
         'description': 'LOW - For normal speaking volume'
     },
     3: {  # Medium (Default)
         'min_rms': 0.001,
         'min_peak': 0.005,
-        'record_boost': 8,    # 18dB
-        'live_boost': 6,      # 15.6dB
-        'visual_boost': 4,    # 12dB
+        'record_boost': 8,
+        'live_boost': 6,
+        'visual_boost': 4,
         'description': 'MEDIUM - For quiet speaking'
     },
     4: {  # High
         'min_rms': 0.0005,
         'min_peak': 0.0025,
-        'record_boost': 16,   # 24dB
-        'live_boost': 12,     # 21.6dB
-        'visual_boost': 8,    # 18dB
+        'record_boost': 16,
+        'live_boost': 12,
+        'visual_boost': 8,
         'description': 'HIGH - For whispers'
     },
     5: {  # Very High
         'min_rms': 0.0001,
         'min_peak': 0.0005,
-        'record_boost': 32,   # 30dB
-        'live_boost': 24,     # 27.6dB
-        'visual_boost': 16,   # 24dB
+        'record_boost': 32,
+        'live_boost': 24,
+        'visual_boost': 16,
         'description': 'VERY HIGH - For extremely quiet sounds'
     }
 }
@@ -111,100 +120,233 @@ should_exit = False
 audio_stream = None
 entropy_collected = 0
 entropy_bits = 0
-sensitivity_level = 3  # Default to medium sensitivity
+sensitivity_level = 3
 
-# ========== CRYPTO CORE ==========
-class AudioCrypto:
-    @staticmethod
-    def generate_audio_seed(audio_samples):
-        """Generate cryptographic seed from audio with OS entropy mixing"""
-        if verbose:
-            print("[VERBOSE] Generating audio seed with OS entropy mixing...")
-        
-        # Apply amplification based on sensitivity level
-        boost = SENSITIVITY_LEVELS[sensitivity_level]['record_boost']
-        amplified = audio_samples.astype(np.float32) * boost
-        
-        audio_bytes = amplified.tobytes()
-        os_entropy = os.urandom(32)
-        seed = hashlib.blake2b(audio_bytes + os_entropy).digest()
-        
-        if verbose:
-            print(f"[VERBOSE] Audio seed generated: {seed.hex()[:16]}...")
-            rms = np.sqrt(np.mean(amplified**2))
-            peak = np.max(np.abs(amplified))
-            print(f"[VERBOSE] Enhanced audio levels - RMS: {rms:.8f}, Peak: {peak:.8f}")
-            print(f"[VERBOSE] Using sensitivity level {sensitivity_level}: {SENSITIVITY_LEVELS[sensitivity_level]['description']}")
-            
-        return seed
+# ========== STREAMING STATE ==========
+audio_entropy_buffer = queue.Queue(maxsize=1000)
+current_audio_entropy = b""
+stream_is_running = False
+stream_total_encrypted = 0
+stream_chunk_counter = 0
+stream_output_path = None
+stop_encryption_flag = threading.Event()
+original_file_removed = False  # Flag untuk menandai file original sudah dihapus
 
-    @staticmethod
-    def derive_keys(seed, salt=None, info=HKDF_INFO, length=32):
-        """HKDF with BLAKE2b for key derivation"""
-        if verbose:
-            print(f"[VERBOSE] Deriving keys with HKDF (salt: {salt.hex()[:8] if salt else 'None'}...)")
+# ========== REAL-TIME ENCRYPTION CLASS ==========
+class RealTimeStreamEncryptor:
+    def __init__(self, public_key_pem, salt, output_path, input_data=None, original_file=None):
+        self.public_key_pem = public_key_pem
+        self.salt = salt
+        self.output_path = output_path
+        self.input_data = input_data  # None for continuous mode, bytes for file/text mode
+        self.original_file = original_file  # Path ke file original untuk dihapus
+        self.running = False
+        self.thread = None
+        self.chunk_counter = 0
+        self.total_bytes = 0
+        self.is_continuous = (input_data is None)
+        self.original_removed = False
+        
+        # Setup encryption
+        self.setup_encryption()
+    
+    def setup_encryption(self):
+        """Setup encryption for real-time streaming"""
+        print("[STREAM] Setting up real-time encryption...")
+        
+        # Generate ephemeral key pair
+        self.ephemeral_private = x25519.X25519PrivateKey.generate()
+        
+        # Load public key
+        public_key = serialization.load_pem_public_key(self.public_key_pem)
+        
+        # Generate shared key
+        shared_key = self.ephemeral_private.exchange(public_key)
+        
+        # Derive encryption key
         hkdf = HKDF(
             algorithm=hashes.BLAKE2b(64),
-            length=length,
-            salt=salt,
-            info=info,
+            length=32,
+            salt=self.salt,
+            info=b"VoxCrypt Real-time Stream",
             backend=default_backend()
         )
-        return hkdf.derive(seed)
-
-    @staticmethod
-    def generate_key_pair(seed):
-        """X25519 key pair from audio seed"""
-        if verbose:
-            print("[VERBOSE] Generating X25519 key pair from audio seed...")
-        private_key = x25519.X25519PrivateKey.from_private_bytes(
-            AudioCrypto.derive_keys(seed, info=b"Key generation salt")
-        )
-        public_key = private_key.public_key()
-        if verbose:
-            print("[VERBOSE] Key pair generated successfully")
-        return private_key, public_key
-
-    @staticmethod
-    def encrypt_data(data, public_key_pem, salt):
-        """ChaCha20Poly1305 encryption with ephemeral key pair - FIXED"""
-        if verbose:
-            print("[VERBOSE] Starting ChaCha20Poly1305 encryption...")
+        self.enc_key = hkdf.derive(shared_key)
         
-        ephemeral_private = x25519.X25519PrivateKey.generate()
-        if verbose:
-            print("[VERBOSE] Generated ephemeral private key")
+        # Create cipher
+        self.cipher = ChaCha20Poly1305(self.enc_key)
         
-        # Load the public key from PEM bytes (FIXED)
-        public_key = serialization.load_pem_public_key(public_key_pem)
-        if verbose:
-            print("[VERBOSE] Loaded recipient public key")
+        # Initial nonce
+        self.initial_nonce = os.urandom(NONCE_SIZE)
         
-        shared_key = ephemeral_private.exchange(public_key)
-        if verbose:
-            print(f"[VERBOSE] Shared key established: {shared_key.hex()[:16]}...")
-        
-        enc_key = AudioCrypto.derive_keys(shared_key, salt)
-        if verbose:
-            print(f"[VERBOSE] Encryption key derived: {enc_key.hex()[:16]}...")
-        
-        cipher = ChaCha20Poly1305(enc_key)
-        nonce = os.urandom(NONCE_SIZE)
-        if verbose:
-            print(f"[VERBOSE] Generated nonce: {nonce.hex()}")
-        
-        ciphertext = cipher.encrypt(nonce, data, None)
-        if verbose:
-            print(f"[VERBOSE] Data encrypted: {len(ciphertext)} bytes")
-        
-        return {
-            'ephemeral_pub': ephemeral_private.public_key().public_bytes(
+        # Write header to file
+        with open(self.output_path, 'wb') as f:
+            f.write(b'VXC3S')  # Streaming format marker
+            f.write(self.salt)
+            f.write(self.ephemeral_private.public_key().public_bytes(
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PublicFormat.SubjectPublicKeyInfo
-            ),
-            'nonce': nonce,
-            'ciphertext': ciphertext
-        }
+            ))
+            f.write(self.initial_nonce)
+        
+        print(f"[STREAM] Header written to {self.output_path}")
+    
+    def generate_continuous_chunk(self):
+        """Generate pseudo-random data for continuous encryption"""
+        timestamp = int(time.time() * 1000000)
+        random_data = os.urandom(8)
+        
+        # Get latest audio entropy (for data generation only, not for nonce)
+        audio_entropy = b""
+        try:
+            audio_entropy = audio_entropy_buffer.get_nowait()
+        except queue.Empty:
+            pass
+        
+        # Generate unique data using audio entropy (this is fine - data can be random)
+        seed = str(timestamp).encode() + random_data + audio_entropy
+        seed_hash = hashlib.sha256(seed).digest()
+        
+        chunk_data = bytearray(STREAM_CHUNK_SIZE)
+        for i in range(STREAM_CHUNK_SIZE):
+            chunk_data[i] = (
+                seed_hash[i % 32] + 
+                (timestamp >> (i % 24)) + 
+                (len(audio_entropy) if audio_entropy else 0)
+            ) % 256
+        
+        return bytes(chunk_data)
+    
+    def get_file_chunk(self):
+        """Get next chunk from input file/data"""
+        if self.input_data is None:
+            return None
+        
+        # Calculate position
+        start_pos = self.chunk_counter * STREAM_CHUNK_SIZE
+        if start_pos >= len(self.input_data):
+            return None  # End of data
+        
+        # Get chunk
+        end_pos = min(start_pos + STREAM_CHUNK_SIZE, len(self.input_data))
+        chunk = self.input_data[start_pos:end_pos]
+        
+        # Pad if needed
+        if len(chunk) < STREAM_CHUNK_SIZE:
+            chunk = chunk + os.urandom(STREAM_CHUNK_SIZE - len(chunk))
+        
+        return chunk
+    
+    def encrypt_and_write_chunk(self):
+        """Encrypt and write one chunk to file"""
+        # Get data for this chunk
+        if self.is_continuous:
+            chunk_data = self.generate_continuous_chunk()
+        else:
+            chunk_data = self.get_file_chunk()
+            if chunk_data is None:
+                return None  # End of file
+        
+        # Generate nonce for this chunk - ONLY use chunk counter, NO audio entropy
+        # This ensures the nonce can be reproduced during decryption
+        nonce = bytearray(self.initial_nonce)
+        
+        # XOR with chunk counter (first 4 bytes, little-endian)
+        for i in range(min(len(nonce), 4)):
+            nonce[i] ^= ((self.chunk_counter >> (i * 8)) & 0xFF)
+        
+        # IMPORTANT: Audio entropy is NOT used in nonce generation
+        # This makes streaming mode decryptable without storing entropy values
+        
+        # Encrypt chunk
+        encrypted_chunk = self.cipher.encrypt(bytes(nonce), chunk_data, None)
+        
+        # Append to file
+        with open(self.output_path, 'ab') as f:
+            f.write(encrypted_chunk)
+        
+        self.chunk_counter += 1
+        self.total_bytes += len(encrypted_chunk)
+        
+        return len(encrypted_chunk)
+    
+    def run_encryption(self):
+        """Run encryption until stopped or data exhausted"""
+        global stream_is_running, stream_total_encrypted, stream_chunk_counter, original_file_removed
+        
+        self.running = True
+        stream_is_running = True
+        
+        print(f"[STREAM] Starting {'continuous' if self.is_continuous else 'file'} encryption...")
+        print(f"[STREAM] Output: {self.output_path}")
+        print(f"[STREAM] Mode: {'CONTINUOUS (runs forever)' if self.is_continuous else f'FILE ({len(self.input_data)} bytes)'}")
+        print(f"[STREAM] Nonce mode: Counter-based only (decryptable)")
+        
+        try:
+            while self.running and not stop_encryption_flag.is_set():
+                start_time = time.time()
+                
+                # Encrypt and write one chunk
+                result = self.encrypt_and_write_chunk()
+                
+                if result is None:  # End of file data
+                    print("[STREAM] File encryption complete")
+                    break
+                
+                chunk_size = result
+                
+                stream_total_encrypted = self.total_bytes
+                stream_chunk_counter = self.chunk_counter
+                
+                # HAPUS FILE ORIGINAL SEGERA SETELAH CHUNK PERTAMA DITULIS
+                # Ini memastikan file langsung diganti saat enkripsi dimulai
+                if not self.original_removed and self.original_file and self.chunk_counter >= 1:
+                    try:
+                        if os.path.exists(self.original_file):
+                            os.remove(self.original_file)
+                            self.original_removed = True
+                            original_file_removed = True
+                            print(f"\n[!] ORIGINAL FILE REPLACED: {self.original_file} -> {self.output_path}")
+                            print(f"    (Original file deleted after first encrypted chunk)")
+                    except Exception as e:
+                        print(f"\n[!] WARNING: Could not remove original file: {str(e)}")
+                
+                # Verbose output
+                if verbose and self.chunk_counter % 50 == 0:
+                    file_size = os.path.getsize(self.output_path)
+                    print(f"[STREAM] Chunk #{self.chunk_counter}: {file_size:,} bytes total")
+                
+                # Calculate sleep time
+                elapsed = time.time() - start_time
+                sleep_time = max(0, STREAM_ENCRYPTION_INTERVAL - elapsed)
+                
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                    
+        except KeyboardInterrupt:
+            print("\n[STREAM] Encryption interrupted by user")
+        except Exception as e:
+            print(f"[STREAM] Error: {str(e)}")
+        finally:
+            self.running = False
+            stream_is_running = False
+            print(f"\n[STREAM] Encryption stopped")
+            print(f"[STREAM] Final stats:")
+            print(f"[STREAM]   Total chunks: {self.chunk_counter}")
+            print(f"[STREAM]   Total bytes: {self.total_bytes:,}")
+            if os.path.exists(self.output_path):
+                print(f"[STREAM]   File size: {os.path.getsize(self.output_path):,} bytes")
+    
+    def stop(self):
+        """Stop encryption"""
+        self.running = False
+        # Don't try to join our own thread - just set the flag
+        stop_encryption_flag.set()
+    
+    def start(self):
+        """Start encryption in background thread"""
+        self.thread = threading.Thread(target=self.run_encryption, daemon=True)
+        self.thread.start()
 
 # ========== AUDIO HANDLING ==========
 class AudioHandler:
@@ -218,7 +360,6 @@ class AudioHandler:
         print(f"»» SENSITIVITY LEVEL: {sensitivity_level} ({SENSITIVITY_LEVELS[sensitivity_level]['description']}) ««")
         audio_chunks = []
         
-        # Recording settings based on sensitivity level
         boost = SENSITIVITY_LEVELS[sensitivity_level]['record_boost']
         
         stream = sd.InputStream(
@@ -226,22 +367,18 @@ class AudioHandler:
             channels=1, 
             dtype='int16', 
             blocksize=SEED_CHUNK,
-            latency='low',  # Lowest latency for maximum sensitivity
-            extra_settings=None  # No additional filtering
+            latency='low'
         )
         stream.start()
         
         try:
             if verbose:
-                print(f"[VERBOSE] Audio capture started with sensitivity level {sensitivity_level}...")
-                print(f"[VERBOSE] Using {boost}x amplification ({20*np.log10(boost):.1f}dB boost)")
+                print(f"[VERBOSE] Audio capture started...")
             while True:
                 data, _ = stream.read(SEED_CHUNK)
-                # Apply amplification based on sensitivity level
                 amplified_data = data * boost
                 audio_chunks.append(amplified_data.copy().flatten())
                 
-                # Check for Enter key press
                 if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
                     _ = sys.stdin.readline()
                     if verbose:
@@ -253,93 +390,64 @@ class AudioHandler:
         audio_data = np.concatenate(audio_chunks).astype('int16') if audio_chunks else np.array([], dtype='int16')
         if verbose:
             print(f"[VERBOSE] Audio captured: {len(audio_data)} samples")
-            if audio_data.size > 0:
-                rms = np.sqrt(np.mean(audio_data.astype(np.float32)**2))
-                peak = np.max(np.abs(audio_data))
-                print(f"[VERBOSE] Audio levels - RMS: {rms:.8f}, Peak: {peak}")
         return audio_data
 
     @staticmethod
     def frame_has_voice(frame_i16):
-        """Detect if audio frame contains any sound - sensitivity based on level"""
+        """Detect if audio frame contains any sound"""
         if frame_i16.size == 0:
             return False
         
-        # Get sensitivity thresholds
         min_rms = SENSITIVITY_LEVELS[sensitivity_level]['min_rms']
         min_peak = SENSITIVITY_LEVELS[sensitivity_level]['min_peak']
         boost = SENSITIVITY_LEVELS[sensitivity_level]['live_boost']
         
-        # Convert to float and normalize
         audio_float = frame_i16.astype(np.float32) / 32768.0
-        
-        # Apply amplification based on sensitivity level
         amplified = audio_float * boost
         
-        # Calculate RMS (root mean square) for volume detection
         rms = np.sqrt(np.mean(amplified**2))
-        
-        # Calculate peak amplitude
         peak = np.max(np.abs(amplified))
         
-        # Sensitivity-based thresholds
-        has_sound = (rms >= min_rms) or (peak >= min_peak)
-        
-        if verbose and has_sound:
-            print(f"[VERBOSE] Sound detected - RMS: {rms:.8f}, Peak: {peak:.8f}")
-            
-        return has_sound
-
-    @staticmethod
-    def calculate_entropy(audio_data):
-        """Calculate approximate entropy bits from audio data"""
-        if audio_data.size < 100:
-            return 0
-            
-        # Convert to normalized float
-        audio_float = audio_data.astype(np.float32) / 32768.0
-        
-        # Calculate simple entropy approximation
-        diff = np.diff(audio_float)
-        unique_vals = len(np.unique(np.round(diff, decimals=4)))
-        
-        # Approximate entropy bits (log2 of unique values)
-        entropy_bits = np.log2(max(2, unique_vals))
-        
-        return entropy_bits
+        return (rms >= min_rms) or (peak >= min_peak)
 
     @staticmethod
     def live_audio_callback(indata, frames, time_info, status):
-        """Live audio callback for visualization and salt generation"""
+        """Live audio callback for visualization and entropy collection"""
         global latest_audio_frame, current_salt, current_salt_src, entropy_collected, entropy_bits
+        global current_audio_entropy
         
-        # Apply amplification based on sensitivity level
         boost = SENSITIVITY_LEVELS[sensitivity_level]['live_boost']
         amplified_data = indata[:, 0].astype(np.float32) * boost
         latest_audio_frame = amplified_data.astype(np.int16)
         
         if AudioHandler.frame_has_voice(latest_audio_frame):
-            # Calculate entropy from this frame
-            frame_entropy = AudioHandler.calculate_entropy(latest_audio_frame)
+            frame_entropy = np.log2(max(2, len(np.unique(np.round(np.diff(amplified_data), decimals=4)))))
             entropy_bits += frame_entropy
             entropy_collected += 1
             
-            # Update salt with this high-entropy audio
+            # Generate audio entropy for data generation (not for nonce)
+            audio_bytes = latest_audio_frame.tobytes()
+            audio_hash = hashlib.sha256(audio_bytes).digest()[:8]
+            
+            # Put in buffer for encryption thread (used only for data generation)
+            try:
+                audio_entropy_buffer.put_nowait(audio_hash)
+                current_audio_entropy = audio_hash
+            except queue.Full:
+                pass
+            
             current_salt = hashlib.blake2b(latest_audio_frame.tobytes()).digest()
             current_salt_src = f"mic-voice ({entropy_bits:.1f} bits)"
-            
-            if verbose and entropy_collected % 10 == 0:
-                print(f"[VERBOSE] Entropy collected: {entropy_bits:.1f} bits from {entropy_collected} frames")
-                print(f"[VERBOSE] Current salt: {current_salt.hex()[:8]}...")
         else:
             current_salt = b""
             current_salt_src = "static"
+            current_audio_entropy = b""
 
 # ========== FILE OPERATIONS ==========
 class SecureFile:
     @staticmethod
-    def encrypt_file(input_path, output_path, public_key_pem):
-        """Encrypt file with authenticated format - FIXED"""
+    def encrypt_file(input_path, output_path, public_key_pem, replace_original=False):
+        """Encrypt file with authenticated format - Standard mode (non-streaming)"""
         if verbose:
             print(f"[VERBOSE] Reading input file: {input_path}")
         with open(input_path, 'rb') as f:
@@ -352,12 +460,31 @@ class SecureFile:
         if verbose:
             print(f"[VERBOSE] Generated salt: {salt.hex()[:8]}...")
         
-        encrypted = AudioCrypto.encrypt_data(data, public_key_pem, salt)
+        # Standard encryption
+        ephemeral_private = x25519.X25519PrivateKey.generate()
+        public_key = serialization.load_pem_public_key(public_key_pem)
+        shared_key = ephemeral_private.exchange(public_key)
         
-        hmac_key = AudioCrypto.derive_keys(salt, info=b"HMAC key")
+        hkdf = HKDF(
+            algorithm=hashes.BLAKE2b(64),
+            length=32,
+            salt=salt,
+            info=HKDF_INFO,
+            backend=default_backend()
+        )
+        enc_key = hkdf.derive(shared_key)
+        
+        cipher = ChaCha20Poly1305(enc_key)
+        nonce = os.urandom(NONCE_SIZE)
+        ciphertext = cipher.encrypt(nonce, data, None)
+        
+        # HMAC for authentication
+        hmac_key = hkdf.derive(shared_key + b"HMAC key")
         h = hmac.HMAC(hmac_key, hashes.BLAKE2b(64), backend=default_backend())
-
-        data_to_hmac = encrypted['ephemeral_pub'] + encrypted['nonce'] + encrypted['ciphertext']
+        data_to_hmac = ephemeral_private.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        ) + nonce + ciphertext
         h.update(data_to_hmac)
         hmac_value = h.finalize()
         
@@ -366,19 +493,30 @@ class SecureFile:
             print(f"[VERBOSE] Writing encrypted file: {output_path}")
         
         with open(output_path, 'wb') as f:
-            f.write(b'VXC3H')  # Format marker
+            f.write(b'VXC3H')  # Standard format marker
             f.write(salt)
             f.write(hmac_value)
-            f.write(encrypted['ephemeral_pub'])
-            f.write(encrypted['nonce'])
-            f.write(encrypted['ciphertext'])
+            f.write(ephemeral_private.public_key().public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            ))
+            f.write(nonce)
+            f.write(ciphertext)
+        
+        # Handle replace-original for standard mode
+        if replace_original and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            try:
+                os.remove(input_path)
+                print(f"\n[!] ORIGINAL FILE REPLACED: {input_path} -> {output_path}")
+            except Exception as e:
+                print(f"\n[!] WARNING: Could not remove original file: {str(e)}")
         
         if verbose:
             print("[VERBOSE] File encryption completed successfully")
 
     @staticmethod
     def encrypt_file_from_data(data, output_path, public_key_pem):
-        """Encrypt raw data with authenticated format (for text input) - FIXED"""
+        """Encrypt raw data with authenticated format (for text input) - Standard mode"""
         if verbose:
             print(f"[VERBOSE] Encrypting text data: {len(data)} bytes")
         
@@ -386,12 +524,31 @@ class SecureFile:
         if verbose:
             print(f"[VERBOSE] Generated salt: {salt.hex()[:8]}...")
         
-        encrypted = AudioCrypto.encrypt_data(data, public_key_pem, salt)
+        # Standard encryption
+        ephemeral_private = x25519.X25519PrivateKey.generate()
+        public_key = serialization.load_pem_public_key(public_key_pem)
+        shared_key = ephemeral_private.exchange(public_key)
         
-        hmac_key = AudioCrypto.derive_keys(salt, info=b"HMAC key")
+        hkdf = HKDF(
+            algorithm=hashes.BLAKE2b(64),
+            length=32,
+            salt=salt,
+            info=HKDF_INFO,
+            backend=default_backend()
+        )
+        enc_key = hkdf.derive(shared_key)
+        
+        cipher = ChaCha20Poly1305(enc_key)
+        nonce = os.urandom(NONCE_SIZE)
+        ciphertext = cipher.encrypt(nonce, data, None)
+        
+        # HMAC for authentication
+        hmac_key = hkdf.derive(shared_key + b"HMAC key")
         h = hmac.HMAC(hmac_key, hashes.BLAKE2b(64), backend=default_backend())
-
-        data_to_hmac = encrypted['ephemeral_pub'] + encrypted['nonce'] + encrypted['ciphertext']
+        data_to_hmac = ephemeral_private.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        ) + nonce + ciphertext
         h.update(data_to_hmac)
         hmac_value = h.finalize()
         
@@ -400,12 +557,15 @@ class SecureFile:
             print(f"[VERBOSE] Writing encrypted file: {output_path}")
         
         with open(output_path, 'wb') as f:
-            f.write(b'VXC3H')  # Format marker
+            f.write(b'VXC3H')  # Standard format marker
             f.write(salt)
             f.write(hmac_value)
-            f.write(encrypted['ephemeral_pub'])
-            f.write(encrypted['nonce'])
-            f.write(encrypted['ciphertext'])
+            f.write(ephemeral_private.public_key().public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            ))
+            f.write(nonce)
+            f.write(ciphertext)
         
         if verbose:
             print("[VERBOSE] Text encryption completed successfully")
@@ -450,14 +610,10 @@ def prepare_display_data(audio_int16, target_len=DISPLAY_LEN):
     if not audio_int16.size:
         return np.linspace(0, 1, target_len), np.zeros(target_len)
     
-    # Convert to float and normalize
     display = audio_int16.astype(np.float32) / 32768.0
-    
-    # Apply amplification based on sensitivity level for visualization
     visual_boost = SENSITIVITY_LEVELS[sensitivity_level]['visual_boost']
     display = display * visual_boost
     
-    # Minimal smoothing to preserve all audio details
     if len(display) >= SMOOTHING:
         kernel = np.ones(SMOOTHING) / SMOOTHING
         display = np.convolve(display, kernel, mode='same')
@@ -467,10 +623,10 @@ def prepare_display_data(audio_int16, target_len=DISPLAY_LEN):
     return x_new, np.interp(x_new, np.linspace(0, 1, len(display)), display)
 
 def update_cyber_visual(_frame_idx):
-    """Update the cyberpunk visualization with verbose details"""
+    """Update the cyberpunk visualization"""
     global user_finalized, dot_animation_state, should_exit
+    global stream_total_encrypted, stream_is_running, current_audio_entropy, stream_chunk_counter, original_file_removed
     
-    # Increment animation state (cycles 0-3)
     dot_animation_state = (dot_animation_state + 1) % 4
     
     # Check for Enter key press
@@ -478,12 +634,10 @@ def update_cyber_visual(_frame_idx):
         _ = sys.stdin.readline()
         user_finalized = True
         should_exit = True
-        # Set a flag to stop animation instead of immediately closing
         if hasattr(update_cyber_visual, 'animation_running'):
             update_cyber_visual.animation_running = False
         return []
     
-    # Check if animation should stop
     if hasattr(update_cyber_visual, 'animation_running') and not update_cyber_visual.animation_running:
         return []
     
@@ -510,36 +664,32 @@ def update_cyber_visual(_frame_idx):
     update_cyber_visual.glow.set_data(x_vals, y_disp)
     ax.add_collection(update_cyber_visual.segments)
     
-    # Create animated recording status
     recording_status = "RECORDING" + "." * dot_animation_state
-    if encryption_done:
-        status_text = "ENCRYPTION COMPLETE"
-    else:
-        status_text = recording_status
+    status_text = recording_status
     
     status = [
-        f"▓▓▓ ADJUSTABLE ENTROPY COLLECTION ▓▓▓",
+        f"▓▓▓ VOXCRYPT ENCRYPTOR ▓▓▓",
         f"» SENSITIVITY: LEVEL {sensitivity_level} - {SENSITIVITY_LEVELS[sensitivity_level]['description']}",
-        f"» SALT: {current_salt.hex()[:12]}..." if current_salt else "» SALT: [SYSTEM DEFAULT]",
-        f"» KEY SOURCE: {current_salt_src.upper()}",
+        f"» CURRENT ENTROPY: {current_audio_entropy.hex()[:8]}..." if current_audio_entropy else "» CURRENT ENTROPY: [SILENT]",
         f"» ENTROPY COLLECTED: {entropy_bits:.1f} bits",
         f"» STATUS: {status_text}"
     ]
     
-    if encryption_done:
+    if stream_is_running:
+        file_size = os.path.getsize(stream_output_path) if stream_output_path and os.path.exists(stream_output_path) else 0
         status.extend([
             "",
-            "▓▓▓ MISSION SUMMARY ▓▓▓",
-            f"» OUTPUT: {base_name}.vxc",
-            f"» TOTAL ENTROPY: {entropy_bits:.1f} bits"
+            f"▓▓▓ STREAMING ENCRYPTION ACTIVE ▓▓▓",
+            f"» CHUNKS: {stream_chunk_counter:,}",
+            f"» BYTES: {stream_total_encrypted:,}",
+            f"» FILE SIZE: {file_size:,} bytes",
+            f"» MODE: {'CONTINUOUS' if not args.input and not args.input_file else 'FILE/TEXT'}",
+            f"» NONCE: Counter-based (decryptable)"
         ])
         
-        if verbose:
-            status.extend([
-                "",
-                "▓▓▓ LIVE CRYPTO DETAILS ▓▓▓",
-                f"» CURRENT SALT: {current_salt.hex()[:16]}..." if current_salt else "» NO ACTIVE SALT"
-            ])
+        # Tampilkan status replace original
+        if original_file_removed:
+            status.append(f"» ORIGINAL: REPLACED ✓")
     
     update_cyber_visual.info_txt.set_text("\n".join(status))
     
@@ -548,34 +698,49 @@ def update_cyber_visual(_frame_idx):
 # ========== MAIN APPLICATION ==========
 def main():
     global encryption_active, user_finalized, args, verbose, encryption_done, base_name, audio_stream, sensitivity_level
+    global stream_output_path, original_file_removed
     
     parser = argparse.ArgumentParser(
-        description="VoxCrypt Ultimate - Audio-Based Secure Encryption with Adjustable Sensitivity",
+        description="VoxCrypt Ultimate - Audio-Based Secure Encryption with Real-time Streaming",
         epilog="Examples:\n"
-               "  Encrypt file: voxcrypt -I secret.doc -k key.pem\n"
-               "  Encrypt text: voxcrypt -i \"secret message\" -k text.pem\n"
+               "  Standard file encryption: voxcrypt -I secret.doc -k key.pem\n"
+               "  Standard text encryption: voxcrypt -i \"secret message\" -k key.pem\n"
+               "  Streaming file encryption: voxcrypt -I file.txt --stream -k key.pem\n"
+               "  Streaming text encryption: voxcrypt -i \"Test123\" --stream -k key.pem\n"
+               "  Continuous encryption (no input): voxcrypt --stream -k key.pem -o stream.vxc\n"
+               "  Replace original file immediately: voxcrypt -I file.txt --stream -k key.pem --replace-original\n"
                "  High sensitivity: voxcrypt -I file.txt -k key.pem -ss 5\n"
                "  Low sensitivity: voxcrypt -I file.txt -k key.pem -ss 1"
     )
     
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("-i", "--input", help="Text to encrypt")
-    group.add_argument("-I", "--input-file", help="File to encrypt")
-    group.add_argument("--stream", help="Stream source to encrypt")
+    parser.add_argument("-i", "--input", help="Text to encrypt")
+    parser.add_argument("-I", "--input-file", help="File to encrypt")
+    parser.add_argument("--stream", help="Enable real-time streaming encryption", action="store_true")
+    parser.add_argument("-o", "--output", help="Output file name (optional)")
+    parser.add_argument("--replace-original", help="Replace original file with .vxc immediately during encryption", action="store_true")
     
     parser.add_argument("-k", "--key", help="Output key file", required=True)
-    parser.add_argument("--replace-original", help="Replace original file after encryption", action="store_true")
     parser.add_argument("--no-visual", help="Disable visualization", action="store_true")
-    parser.add_argument("-v", "--verbose", help="Enable verbose output during process", action="store_true")
+    parser.add_argument("-v", "--verbose", help="Enable verbose output", action="store_true")
     parser.add_argument("-ss", "--sound-sensitivity", 
                        type=int, 
                        choices=[1, 2, 3, 4, 5],
                        default=3,
-                       help="Sound sensitivity level (1-5): 1=Very Low, 2=Low, 3=Medium, 4=High, 5=Very High")
+                       help="Sound sensitivity level (1-5)")
     
     args = parser.parse_args()
     verbose = args.verbose
     sensitivity_level = args.sound_sensitivity
+    
+    # Validate arguments
+    if not args.input and not args.input_file and not args.stream:
+        print("[!] ERROR: You must specify either -i (text), -I (file), or --stream for continuous mode")
+        sys.exit(1)
+    
+    # Validate replace-original (only works with file input)
+    if args.replace_original and not args.input_file:
+        print("[!] ERROR: --replace-original can only be used with -I (file input)")
+        sys.exit(1)
     
     try:
         # Initialize
@@ -587,36 +752,106 @@ def main():
             print(f"[VERBOSE] Arguments: {vars(args)}")
             print(f"[VERBOSE] Using sensitivity level {sensitivity_level}: {SENSITIVITY_LEVELS[sensitivity_level]['description']}")
         
-        # Set base name
-        if args.input_file:
-            base_name = os.path.splitext(args.input_file)[0]
-        else:
-            base_name = "message"
+        # Determine mode
+        is_stream_mode = args.stream
+        is_file_input = args.input_file is not None
+        is_text_input = args.input is not None
         
-        # Audio seed generation
-        if verbose:
-            print("[VERBOSE] Starting audio capture...")
+        original_file_path = None
+        if is_file_input:
+            # File input mode
+            input_path = args.input_file
+            if not os.path.exists(input_path):
+                print(f"[!] ERROR: File not found: {input_path}")
+                sys.exit(1)
+            
+            base_name = os.path.splitext(input_path)[0]
+            output_path = args.output if args.output else f"{base_name}.vxc"
+            original_file_path = input_path
+            
+            if verbose:
+                print(f"[VERBOSE] Input file: {input_path}")
+                print(f"[VERBOSE] Output file: {output_path}")
+            
+            # Read file data
+            with open(input_path, 'rb') as f:
+                file_data = f.read()
+            
+            file_size = len(file_data)
+            if verbose:
+                print(f"[VERBOSE] File size: {file_size} bytes")
+            
+        elif is_text_input:
+            # Text input mode
+            text_input = args.input
+            base_name = "message"
+            output_path = args.output if args.output else f"{base_name}.vxc"
+            
+            if verbose:
+                print(f"[VERBOSE] Text input: {text_input}")
+            
+            file_data = text_input.encode('utf-8')
+            file_size = len(file_data)
+            
+            if verbose:
+                print(f"[VERBOSE] Text size: {file_size} bytes")
+            
+        else:
+            # Continuous mode (no input)
+            base_name = "stream"
+            output_path = args.output if args.output else "continuous_stream.vxc"
+            file_data = None  # Continuous mode generates its own data
+            file_size = 0
+            
+            print("▓▓▓ CONTINUOUS STREAMING MODE ACTIVATED ▓▓▓")
+            print("▓▓▓ Encryption will run indefinitely until stopped ▓▓▓")
+        
+        # Step 1: Audio capture for key generation
+        print("\n▓▓▓ INITIAL AUDIO CAPTURE FOR KEY GENERATION ▓▓▓")
+        print("▓▓▓ Press Enter, speak for a few seconds, then press Enter again ▓▓▓")
+        
         audio_samples = AudioHandler.record_until_enter()
         if audio_samples.size == 0:
             print("[!] ERROR: No audio captured")
             sys.exit(1)
-            
-        if verbose:
-            print("[VERBOSE] Generating cryptographic seed from audio...")
-        seed = AudioCrypto.generate_audio_seed(audio_samples)
         
-        # Key generation
+        if verbose:
+            print(f"[VERBOSE] Audio captured: {len(audio_samples)} samples")
+        
+        # Step 2: Generate cryptographic seed
+        if verbose:
+            print("[VERBOSE] Generating cryptographic seed...")
+        
+        boost = SENSITIVITY_LEVELS[sensitivity_level]['record_boost']
+        amplified = audio_samples.astype(np.float32) * boost
+        audio_bytes = amplified.tobytes()
+        os_entropy = os.urandom(32)
+        seed = hashlib.blake2b(audio_bytes + os_entropy).digest()
+        
+        # Step 3: Generate key pair
         if verbose:
             print("[VERBOSE] Generating X25519 key pair...")
-        private_key, public_key = AudioCrypto.generate_key_pair(seed)
+        
+        hkdf = HKDF(
+            algorithm=hashes.BLAKE2b(64),
+            length=32,
+            salt=None,
+            info=b"Key generation salt",
+            backend=default_backend()
+        )
+        private_bytes = hkdf.derive(seed)
+        
+        private_key = x25519.X25519PrivateKey.from_private_bytes(private_bytes[:32])
+        public_key = private_key.public_key()
         pub_key_pem = public_key.public_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo
         )
         
-        # Save key
+        # Step 4: Save private key
         if verbose:
             print(f"[VERBOSE] Saving private key to: {args.key}")
+        
         private_key_pem = private_key.private_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PrivateFormat.PKCS8,
@@ -624,25 +859,86 @@ def main():
         )
         with open(args.key, 'wb') as f:
             f.write(private_key_pem)
+        
         print(f"\n▓▓▓ ENCRYPTION KEY SAVED TO {args.key} ▓▓▓")
         
-        # Setup visualization
-        if visualization_enabled:
+        # Step 5: Generate salt from audio
+        salt = hashlib.sha256(audio_bytes).digest()[:SALT_SIZE]
+        if verbose:
+            print(f"[VERBOSE] Using salt: {salt.hex()[:16]}...")
+        
+        stream_output_path = output_path
+        
+        # Step 6: Choose encryption mode
+        if is_stream_mode:
+            # STREAMING MODE (real-time)
+            print(f"\n▓▓▓ STARTING {'CONTINUOUS' if not is_file_input and not is_text_input else 'FILE/TEXT'} STREAMING ENCRYPTION ▓▓▓")
+            print(f"▓▓▓ Output: {output_path} ▓▓▓")
+            
+            # Setup real-time encryptor with original file path for immediate replacement
+            encryptor = RealTimeStreamEncryptor(
+                public_key_pem=pub_key_pem,
+                salt=salt,
+                output_path=output_path,
+                input_data=file_data,  # None for continuous, bytes for file/text
+                original_file=original_file_path if args.replace_original else None
+            )
+            
+            # Start encryption thread
+            encryptor.start()
+            
+            if args.replace_original and original_file_path:
+                print("▓▓▓ IMMEDIATE REPLACE MODE ACTIVE ▓▓▓")
+                print("▓▓▓ Original file will be deleted as soon as encryption starts ▓▓▓")
+            
+            if not is_file_input and not is_text_input:
+                print("▓▓▓ CONTINUOUS ENCRYPTION ACTIVE ▓▓▓")
+                print("▓▓▓ File will grow indefinitely based on audio input ▓▓▓")
+                print("▓▓▓ Press Ctrl+C to stop ▓▓▓")
+            else:
+                print("▓▓▓ FILE/TEXT STREAMING ENCRYPTION ACTIVE ▓▓▓")
+                print("▓▓▓ Encryption will stop when file/text is fully processed ▓▓▓")
+            
+        else:
+            # STANDARD MODE (non-streaming)
+            print(f"\n▓▓▓ STARTING STANDARD ENCRYPTION ▓▓▓")
+            
+            if is_file_input:
+                SecureFile.encrypt_file(args.input_file, output_path, pub_key_pem, args.replace_original)
+            else:  # Text input
+                SecureFile.encrypt_file_from_data(file_data, output_path, pub_key_pem)
+            
+            encryption_done = True
+        
+        # Step 7: Setup visualization if enabled and in streaming mode
+        if visualization_enabled and is_stream_mode:
+            print(f"\n▓▓▓ STARTING VISUALIZATION ▓▓▓")
+            
+            # Start audio stream for visualization
+            audio_stream = sd.InputStream(
+                samplerate=SAMPLE_RATE, 
+                channels=1, 
+                dtype='int16',
+                blocksize=LIVE_CHUNK, 
+                callback=AudioHandler.live_audio_callback,
+                latency='low'
+            )
+            audio_stream.start()
+            
+            # Setup visualization
             global fig, ax
-            if verbose:
-                print("[VERBOSE] Initializing visualization...")
             fig, ax = setup_cyberpunk_display()
             
-            # Initialize visualization elements
             update_cyber_visual.glow, = ax.plot([], [], 
                 color=CYBER_COLORS['blue'],
                 linewidth=18,
                 alpha=GLOW_ALPHA
             )
             
+            mode_text = "CONTINUOUS" if not is_file_input and not is_text_input else "STREAMING"
             update_cyber_visual.info_txt = ax.text(
                 0.02, 0.95,
-                "INITIALIZING ENTROPY COLLECTION...",
+                f"INITIALIZING {mode_text} ENCRYPTION...",
                 transform=ax.transAxes,
                 fontsize=10,
                 fontfamily='monospace',
@@ -651,25 +947,14 @@ def main():
             )
             
             fig.suptitle(
-                f'»» VOXCRYPT ENCRYPTOR - SENSITIVITY LEVEL {sensitivity_level} ««',
+                f'»» VOXCRYPT {mode_text} ENCRYPTOR ««',
                 color=CYBER_COLORS['pink'],
                 fontsize=14,
                 fontweight='bold',
                 fontfamily='monospace'
             )
             
-            # Start audio stream for visualization and salt
-            audio_stream = sd.InputStream(
-                samplerate=SAMPLE_RATE, 
-                channels=1, 
-                dtype='int16',
-                blocksize=LIVE_CHUNK, 
-                callback=AudioHandler.live_audio_callback,
-                latency='low'  # Lower latency for better sensitivity
-            )
-            audio_stream.start()
-            
-            # Start animation with event listener
+            # Start animation
             update_cyber_visual.animation_running = True
             ani = FuncAnimation(
                 fig, 
@@ -679,90 +964,99 @@ def main():
                 cache_frame_data=False
             )
             
-            # Add event listener for window close
-            def on_close(event):
-                update_cyber_visual.animation_running = False
-                global user_finalized
-                user_finalized = True
-                
-            fig.canvas.mpl_connect('close_event', on_close)
+            print(f"\n▓▓▓ VISUALIZATION ACTIVE ▓▓▓")
+            print(f"▓▓▓ MONITOR IN ANOTHER TERMINAL: ▓▓▓")
+            print(f"▓▓▓   watch -n 0.1 'ls -lh {output_path} && echo && tail -c 32 {output_path} | xxd -p' ▓▓▓")
+            print(f"\n▓▓▓ SPEAK INTO MICROPHONE TO AFFECT ENCRYPTION ▓▓▓")
+            print(f"▓▓▓ Press Enter in this window to stop visualization ▓▓▓")
+            print(f"▓▓▓ Press Ctrl+C in terminal to stop encryption ▓▓▓")
             
-            print(f"\n▓▓▓ LIVE ENTROPY COLLECTION ACTIVE - SENSITIVITY LEVEL {sensitivity_level} ▓▓▓")
-            print(f"▓▓▓ {SENSITIVITY_LEVELS[sensitivity_level]['description']} ▓▓▓")
-            print("▓▓▓ PRESS ENTER TO FINALIZE ▓▓▓")
+            # Show plt
             plt.show()
             
-            # Stop animation before cleanup
+            # Stop animation
             update_cyber_visual.animation_running = False
             if hasattr(ani, 'event_source') and ani.event_source:
                 ani.event_source.stop()
             
-            # Cleanup
+            # Stop audio stream
             audio_stream.stop()
             audio_stream.close()
-        else:
-            # Non-visual mode
-            print(f"\n▓▓▓ ENCRYPTION IN PROGRESS - SENSITIVITY LEVEL {sensitivity_level} ▓▓▓")
-            print(f"▓▓▓ {SENSITIVITY_LEVELS[sensitivity_level]['description']} ▓▓▓")
-            print("▓▓▓ PRESS ENTER TO FINALIZE ▓▓▓")
-            input()
-            user_finalized = True
+            
+            print(f"\n▓▓▓ VISUALIZATION STOPPED ▓▓▓")
+            if not is_file_input and not is_text_input:
+                print(f"▓▓▓ CONTINUOUS ENCRYPTION CONTINUES IN BACKGROUND ▓▓▓")
+                print(f"▓▓▓ Press Ctrl+C to stop encryption completely ▓▓▓")
         
-        # Perform encryption
-        if args.stream:
-            output_path = f"{args.stream}.vxcs"
-            print(f"\n▓▓▓ ENCRYPTING STREAM: {args.stream} ▓▓▓")
-            if verbose:
-                print("[VERBOSE] Stream encryption selected (not implemented)")
-            print("Stream encryption not implemented")
+        elif visualization_enabled and not is_stream_mode:
+            # Standard mode with visualization
+            print(f"\n▓▓▓ STANDARD ENCRYPTION COMPLETE ▓▓▓")
+            print(f"▓▓▓ Output file: {output_path} ▓▓▓")
+        
         else:
-            output_path = f"{base_name}.vxc"
-            
-            if args.input:
-                if verbose:
-                    print(f"[VERBOSE] Encrypting text input: {args.input}")
-                data = args.input.encode()
-                SecureFile.encrypt_file_from_data(data, output_path, pub_key_pem)
-            else:
-                if verbose:
-                    print(f"[VERBOSE] Encrypting file: {args.input_file}")
-                SecureFile.encrypt_file(args.input_file, output_path, pub_key_pem)
-            
-            if args.replace_original and args.input_file:
-                if verbose:
-                    print(f"[VERBOSE] Removing original file: {args.input_file}")
-                os.remove(args.input_file)
+            # No visualization mode
+            if is_stream_mode:
+                print(f"\n▓▓▓ STREAMING ENCRYPTION ACTIVE ▓▓▓")
+                print(f"▓▓▓ MONITOR IN ANOTHER TERMINAL: ▓▓▓")
+                print(f"▓▓▓   watch -n 0.1 'ls -lh {output_path} && echo && tail -c 32 {output_path} | xxd -p' ▓▓▓")
+                print(f"\n▓▓▓ SPEAK INTO MICROPHONE TO AFFECT ENCRYPTION ▓▓▓")
+                print(f"▓▓▓ Press Ctrl+C to stop ▓▓▓")
                 
-        encryption_done = True
-        print(f"\n▓▓▓ ENCRYPTION COMPLETE ▓▓▓")
-        print(f"» Output: {output_path}")
-        print(f"» Total entropy collected: {entropy_bits:.1f} bits")
+                # Keep running until interrupted (for continuous mode) or file completes
+                try:
+                    while True:
+                        time.sleep(1)
+                except KeyboardInterrupt:
+                    print("\n▓▓▓ Stopping encryption... ▓▓▓")
+            else:
+                print(f"\n▓▓▓ STANDARD ENCRYPTION COMPLETE ▓▓▓")
+                print(f"▓▓▓ Output file: {output_path} ▓▓▓")
         
-        if verbose:
-            print("[VERBOSE] Encryption process completed successfully")
+        # Step 8: Wait for encryption to complete if in streaming mode
+        if is_stream_mode and is_file_input:
+            # For file input in streaming mode, wait for encryption to complete
+            # The encryptor thread will exit when done
+            if hasattr(encryptor, 'thread') and encryptor.thread and encryptor.thread.is_alive():
+                encryptor.thread.join(timeout=30)  # Wait up to 30 seconds
         
-        # Wait for user to press Enter before exiting
-        print("\n▓▓▓ PRESS ENTER TO EXIT ▓▓▓")
-        input()
+        # Step 9: Final cleanup
+        if is_stream_mode:
+            stop_encryption_flag.set()
+            # Give the thread a moment to clean up
+            time.sleep(0.5)
+            
+            # Jika file original belum dihapus (misalnya karena error), coba hapus lagi
+            if args.replace_original and original_file_path and os.path.exists(original_file_path) and not original_file_removed:
+                try:
+                    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                        os.remove(original_file_path)
+                        original_file_removed = True
+                        print(f"\n[!] ORIGINAL FILE REPLACED (final cleanup): {original_file_path} -> {output_path}")
+                except Exception as e:
+                    print(f"\n[!] WARNING: Could not remove original file during cleanup: {str(e)}")
+            
+            print(f"\n▓▓▓ ENCRYPTION COMPLETE ▓▓▓")
+            print(f"▓▓▓ Output file: {output_path} ▓▓▓")
+            print(f"▓▓▓ Key file: {args.key} ▓▓▓")
+            if os.path.exists(output_path):
+                print(f"▓▓▓ Final size: {os.path.getsize(output_path):,} bytes ▓▓▓")
         
+        elif encryption_done:
+            print(f"\n▓▓▓ ENCRYPTION COMPLETE ▓▓▓")
+            print(f"▓▓▓ Output file: {output_path} ▓▓▓")
+            print(f"▓▓▓ Key file: {args.key} ▓▓▓")
+            print(f"▓▓▓ File size: {os.path.getsize(output_path):,} bytes ▓▓▓")
+        
+    except KeyboardInterrupt:
+        print("\n▓▓▓ INTERRUPTED BY USER ▓▓▓")
+        stop_encryption_flag.set()
     except Exception as e:
         print(f"[!] ERROR: {str(e)}")
         import traceback
         traceback.print_exc()
-        
-        # Stop animation if it exists
-        if 'update_cyber_visual' in globals():
-            if hasattr(update_cyber_visual, 'animation_running'):
-                update_cyber_visual.animation_running = False
-        
-        # Wait for user to press Enter even on error
-        print("\n▓▓▓ PRESS ENTER TO EXIT ▓▓▓")
-        input()
-        
-        sys.exit(1)
+        stop_encryption_flag.set()
     finally:
         encryption_active = False
-        # Clean up audio stream if it exists
         if audio_stream:
             try:
                 audio_stream.stop()
